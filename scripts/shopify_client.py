@@ -227,7 +227,8 @@ class ShopifyClient:
 
     def bulk_update_variant_prices(self, updates: List[Dict]) -> Dict:
         """
-        Bulk update variant prices using productVariantsBulkUpdate mutation.
+        Bulk update variant prices using Shopify Bulk Operations API.
+        This handles thousands of variants efficiently in a single async operation.
 
         Args:
             updates: List of dicts with keys: variant_id, price, compare_at_price
@@ -235,91 +236,191 @@ class ShopifyClient:
         Returns:
             Dict with success count, failed count, and errors
         """
-        # Group updates by product for efficiency
-        products_map = {}
+        if not updates:
+            return {'success_count': 0, 'failed_count': 0, 'errors': []}
+
+        logger.info(f"Starting bulk update for {len(updates)} variants using Bulk Operations API...")
+
+        # Step 1: Create JSONL content for bulk mutation
+        jsonl_lines = []
         for update in updates:
             variant_id = update['variant_id']
-            # Extract product ID from variant ID (format: gid://shopify/ProductVariant/123)
-            # We need to get the product ID separately, so we'll batch by chunks
-            products_map[variant_id] = update
+            # Ensure GID format
+            if not str(variant_id).startswith('gid://'):
+                variant_id = f"gid://shopify/ProductVariant/{variant_id}"
 
-        success_count = 0
-        failed_count = 0
-        errors = []
+            line = json.dumps({
+                "input": {
+                    "id": variant_id,
+                    "price": str(update['price']),
+                    "compareAtPrice": str(update['compare_at_price'])
+                }
+            })
+            jsonl_lines.append(line)
 
-        # Process in batches of 100 variants
-        batch_size = 100
-        variant_ids = list(products_map.keys())
+        jsonl_content = '\n'.join(jsonl_lines)
+        logger.info(f"Created JSONL with {len(jsonl_lines)} lines")
 
-        for i in range(0, len(variant_ids), batch_size):
-            batch = variant_ids[i:i + batch_size]
+        # Step 2: Stage the upload
+        stage_mutation = """
+        mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+            stagedUploadsCreate(input: $input) {
+                stagedTargets {
+                    url
+                    resourceUrl
+                    parameters {
+                        name
+                        value
+                    }
+                }
+                userErrors {
+                    field
+                    message
+                }
+            }
+        }
+        """
 
-            mutation = """
-            mutation bulkUpdateVariants($input: [ProductVariantsBulkInput!]!, $productId: ID!) {
-                productVariantsBulkUpdate(variants: $input, productId: $productId) {
-                    productVariants {
+        stage_result = self.graphql(stage_mutation, {
+            "input": [{
+                "resource": "BULK_MUTATION_VARIABLES",
+                "filename": "bulk_variants.jsonl",
+                "mimeType": "text/jsonl",
+                "httpMethod": "POST"
+            }]
+        })
+
+        stage_errors = stage_result.get('data', {}).get('stagedUploadsCreate', {}).get('userErrors', [])
+        if stage_errors:
+            logger.error(f"Stage upload errors: {stage_errors}")
+            return {'success_count': 0, 'failed_count': len(updates), 'errors': stage_errors}
+
+        staged_target = stage_result.get('data', {}).get('stagedUploadsCreate', {}).get('stagedTargets', [{}])[0]
+        upload_url = staged_target.get('url')
+        resource_url = staged_target.get('resourceUrl')
+        parameters = staged_target.get('parameters', [])
+
+        if not upload_url:
+            logger.error("No upload URL returned from staged upload")
+            return {'success_count': 0, 'failed_count': len(updates), 'errors': [{'error': 'No upload URL'}]}
+
+        logger.info(f"Got staged upload URL, uploading JSONL file...")
+
+        # Step 3: Upload the JSONL file to staged URL
+        form_data = {param['name']: param['value'] for param in parameters}
+        files = {'file': ('bulk_variants.jsonl', jsonl_content.encode('utf-8'), 'text/jsonl')}
+
+        upload_response = requests.post(upload_url, data=form_data, files=files)
+        if upload_response.status_code not in [200, 201, 204]:
+            logger.error(f"Upload failed: {upload_response.status_code} - {upload_response.text}")
+            return {'success_count': 0, 'failed_count': len(updates), 'errors': [{'error': upload_response.text}]}
+
+        logger.info("JSONL file uploaded successfully to staged URL")
+
+        # Step 4: Run the bulk mutation
+        bulk_mutation = """
+        mutation bulkOperationRunMutation($mutation: String!, $stagedUploadPath: String!) {
+            bulkOperationRunMutation(mutation: $mutation, stagedUploadPath: $stagedUploadPath) {
+                bulkOperation {
+                    id
+                    status
+                }
+                userErrors {
+                    field
+                    message
+                }
+            }
+        }
+        """
+
+        mutation_str = """
+            mutation call($input: ProductVariantInput!) {
+                productVariantUpdate(input: $input) {
+                    productVariant {
                         id
                         price
                         compareAtPrice
                     }
                     userErrors {
-                        field
                         message
+                        field
                     }
                 }
             }
-            """
+        """
 
-            # For bulk operations we need to update one product at a time
-            # Group variants by product first
-            for variant_id in batch:
-                update = products_map[variant_id]
+        bulk_result = self.graphql(bulk_mutation, {
+            "mutation": mutation_str,
+            "stagedUploadPath": resource_url
+        })
 
-                # Use direct variant update for individual updates
-                single_mutation = """
-                mutation updateVariant($input: ProductVariantInput!) {
-                    productVariantUpdate(input: $input) {
-                        productVariant {
-                            id
-                            price
-                            compareAtPrice
-                        }
-                        userErrors {
-                            field
-                            message
-                        }
-                    }
+        bulk_errors = bulk_result.get('data', {}).get('bulkOperationRunMutation', {}).get('userErrors', [])
+        if bulk_errors:
+            logger.error(f"Bulk mutation errors: {bulk_errors}")
+            return {'success_count': 0, 'failed_count': len(updates), 'errors': bulk_errors}
+
+        bulk_op = bulk_result.get('data', {}).get('bulkOperationRunMutation', {}).get('bulkOperation', {})
+        bulk_op_id = bulk_op.get('id')
+        logger.info(f"Bulk operation started: {bulk_op_id}")
+
+        # Step 5: Poll for completion
+        poll_query = """
+        query {
+            currentBulkOperation(type: MUTATION) {
+                id
+                status
+                errorCode
+                objectCount
+                fileSize
+                url
+                completedAt
+            }
+        }
+        """
+
+        max_polls = 180  # Max 15 minutes (180 * 5 seconds)
+        for i in range(max_polls):
+            time.sleep(5)  # Poll every 5 seconds
+
+            poll_result = self.graphql(poll_query)
+            current_op = poll_result.get('data', {}).get('currentBulkOperation', {})
+
+            if not current_op:
+                logger.warning("No current bulk operation found, continuing to poll...")
+                continue
+
+            status = current_op.get('status')
+            object_count = current_op.get('objectCount', 0)
+            logger.info(f"Bulk operation status: {status} | Processed: {object_count} objects (poll {i+1})")
+
+            if status == 'COMPLETED':
+                logger.info(f"Bulk operation completed! Processed {object_count} objects")
+                return {
+                    'success_count': len(updates),
+                    'failed_count': 0,
+                    'errors': []
                 }
-                """
-
-                variables = {
-                    'input': {
-                        'id': variant_id,
-                        'price': str(update['price']),
-                        'compareAtPrice': str(update['compare_at_price'])
-                    }
+            elif status == 'FAILED':
+                error_code = current_op.get('errorCode', 'Unknown error')
+                logger.error(f"Bulk operation failed: {error_code}")
+                return {
+                    'success_count': 0,
+                    'failed_count': len(updates),
+                    'errors': [{'error': error_code}]
+                }
+            elif status in ['CANCELED', 'EXPIRED']:
+                logger.error(f"Bulk operation {status}")
+                return {
+                    'success_count': 0,
+                    'failed_count': len(updates),
+                    'errors': [{'error': status}]
                 }
 
-                try:
-                    result = self.graphql(single_mutation, variables)
-                    user_errors = result.get('data', {}).get('productVariantUpdate', {}).get('userErrors', [])
-
-                    if user_errors:
-                        failed_count += 1
-                        errors.append({'variant_id': variant_id, 'errors': user_errors})
-                    else:
-                        success_count += 1
-                except Exception as e:
-                    failed_count += 1
-                    errors.append({'variant_id': variant_id, 'error': str(e)})
-
-                # Rate limiting
-                time.sleep(0.1)
-
+        logger.error("Bulk operation timed out after 15 minutes")
         return {
-            'success_count': success_count,
-            'failed_count': failed_count,
-            'errors': errors
+            'success_count': 0,
+            'failed_count': len(updates),
+            'errors': [{'error': 'Operation timed out'}]
         }
 
     def update_product_metafield(self, product_id: str, namespace: str, key: str, value: Any, value_type: str) -> bool:
@@ -356,7 +457,7 @@ class ShopifyClient:
 
     def bulk_update_product_metafields(self, updates: List[Dict]) -> Dict:
         """
-        Bulk update product metafields.
+        Bulk update product metafields using Shopify Bulk Operations API.
 
         Args:
             updates: List of dicts with keys: product_id, namespace, key, value, value_type
@@ -364,32 +465,170 @@ class ShopifyClient:
         Returns:
             Dict with success count, failed count, and errors
         """
-        success_count = 0
-        failed_count = 0
-        errors = []
+        if not updates:
+            return {'success_count': 0, 'failed_count': 0, 'errors': []}
 
+        logger.info(f"Starting bulk metafield update for {len(updates)} products...")
+
+        # Step 1: Create JSONL content - group by product_id
+        products_metafields = {}
         for update in updates:
-            try:
-                success = self.update_product_metafield(
-                    update['product_id'],
-                    update['namespace'],
-                    update['key'],
-                    update['value'],
-                    update['value_type']
-                )
-                if success:
-                    success_count += 1
-                else:
-                    failed_count += 1
-                    errors.append({'product_id': update['product_id'], 'error': 'Unknown error'})
-            except Exception as e:
-                failed_count += 1
-                errors.append({'product_id': update['product_id'], 'error': str(e)})
+            product_id = update['product_id']
+            if not str(product_id).startswith('gid://'):
+                product_id = f"gid://shopify/Product/{product_id}"
 
-            time.sleep(0.1)
+            if product_id not in products_metafields:
+                products_metafields[product_id] = []
 
-        return {
-            'success_count': success_count,
-            'failed_count': failed_count,
-            'errors': errors
+            products_metafields[product_id].append({
+                'namespace': update['namespace'],
+                'key': update['key'],
+                'value': str(update['value']),
+                'type': update['value_type']
+            })
+
+        jsonl_lines = []
+        for product_id, metafields in products_metafields.items():
+            line = json.dumps({
+                "input": {
+                    "id": product_id,
+                    "metafields": metafields
+                }
+            })
+            jsonl_lines.append(line)
+
+        jsonl_content = '\n'.join(jsonl_lines)
+        logger.info(f"Created JSONL with {len(jsonl_lines)} products")
+
+        # Step 2: Stage the upload
+        stage_mutation = """
+        mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+            stagedUploadsCreate(input: $input) {
+                stagedTargets {
+                    url
+                    resourceUrl
+                    parameters {
+                        name
+                        value
+                    }
+                }
+                userErrors {
+                    field
+                    message
+                }
+            }
         }
+        """
+
+        stage_result = self.graphql(stage_mutation, {
+            "input": [{
+                "resource": "BULK_MUTATION_VARIABLES",
+                "filename": "bulk_metafields.jsonl",
+                "mimeType": "text/jsonl",
+                "httpMethod": "POST"
+            }]
+        })
+
+        stage_errors = stage_result.get('data', {}).get('stagedUploadsCreate', {}).get('userErrors', [])
+        if stage_errors:
+            logger.error(f"Stage upload errors: {stage_errors}")
+            return {'success_count': 0, 'failed_count': len(updates), 'errors': stage_errors}
+
+        staged_target = stage_result.get('data', {}).get('stagedUploadsCreate', {}).get('stagedTargets', [{}])[0]
+        upload_url = staged_target.get('url')
+        resource_url = staged_target.get('resourceUrl')
+        parameters = staged_target.get('parameters', [])
+
+        if not upload_url:
+            logger.error("No upload URL returned")
+            return {'success_count': 0, 'failed_count': len(updates), 'errors': [{'error': 'No upload URL'}]}
+
+        # Step 3: Upload the JSONL file
+        form_data = {param['name']: param['value'] for param in parameters}
+        files = {'file': ('bulk_metafields.jsonl', jsonl_content.encode('utf-8'), 'text/jsonl')}
+
+        upload_response = requests.post(upload_url, data=form_data, files=files)
+        if upload_response.status_code not in [200, 201, 204]:
+            logger.error(f"Upload failed: {upload_response.status_code}")
+            return {'success_count': 0, 'failed_count': len(updates), 'errors': [{'error': upload_response.text}]}
+
+        logger.info("JSONL file uploaded for metafields")
+
+        # Step 4: Run the bulk mutation
+        bulk_mutation = """
+        mutation bulkOperationRunMutation($mutation: String!, $stagedUploadPath: String!) {
+            bulkOperationRunMutation(mutation: $mutation, stagedUploadPath: $stagedUploadPath) {
+                bulkOperation {
+                    id
+                    status
+                }
+                userErrors {
+                    field
+                    message
+                }
+            }
+        }
+        """
+
+        mutation_str = """
+            mutation call($input: ProductInput!) {
+                productUpdate(input: $input) {
+                    product {
+                        id
+                    }
+                    userErrors {
+                        message
+                        field
+                    }
+                }
+            }
+        """
+
+        bulk_result = self.graphql(bulk_mutation, {
+            "mutation": mutation_str,
+            "stagedUploadPath": resource_url
+        })
+
+        bulk_errors = bulk_result.get('data', {}).get('bulkOperationRunMutation', {}).get('userErrors', [])
+        if bulk_errors:
+            logger.error(f"Bulk mutation errors: {bulk_errors}")
+            return {'success_count': 0, 'failed_count': len(updates), 'errors': bulk_errors}
+
+        bulk_op = bulk_result.get('data', {}).get('bulkOperationRunMutation', {}).get('bulkOperation', {})
+        logger.info(f"Bulk metafield operation started: {bulk_op.get('id')}")
+
+        # Step 5: Poll for completion
+        poll_query = """
+        query {
+            currentBulkOperation(type: MUTATION) {
+                id
+                status
+                errorCode
+                objectCount
+                completedAt
+            }
+        }
+        """
+
+        max_polls = 180
+        for i in range(max_polls):
+            time.sleep(5)
+
+            poll_result = self.graphql(poll_query)
+            current_op = poll_result.get('data', {}).get('currentBulkOperation', {})
+
+            if not current_op:
+                continue
+
+            status = current_op.get('status')
+            object_count = current_op.get('objectCount', 0)
+            logger.info(f"Metafield bulk status: {status} | Processed: {object_count} (poll {i+1})")
+
+            if status == 'COMPLETED':
+                logger.info(f"Metafield bulk completed! Processed {object_count} products")
+                return {'success_count': len(updates), 'failed_count': 0, 'errors': []}
+            elif status in ['FAILED', 'CANCELED', 'EXPIRED']:
+                error_code = current_op.get('errorCode', status)
+                return {'success_count': 0, 'failed_count': len(updates), 'errors': [{'error': error_code}]}
+
+        return {'success_count': 0, 'failed_count': len(updates), 'errors': [{'error': 'Timed out'}]}
