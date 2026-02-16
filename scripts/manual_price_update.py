@@ -208,6 +208,7 @@ def process_products(
 
             updates.append({
                 'variant_id': variant_id,
+                'product_id': product_id,
                 'price': price,
                 'compare_at_price': compare_at_price
             })
