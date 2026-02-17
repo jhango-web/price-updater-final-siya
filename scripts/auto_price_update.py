@@ -58,8 +58,23 @@ def fetch_silver_price(api_key: str) -> Optional[float]:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         data = response.json()
-        # price_gram is the silver price per gram
-        price = data.get('price_gram')
+
+        # Try different keys that goldapi.io might return for silver per gram price
+        price = data.get('price_gram_24k')  # Some APIs use same key as gold
+        if price is None:
+            price = data.get('price_gram')  # Standard silver key
+        if price is None:
+            # Fallback: calculate from troy ounce price (1 troy oz = 31.1035 grams)
+            price_per_oz = data.get('price')
+            if price_per_oz:
+                price = price_per_oz / 31.1035
+                logger.info(f"Calculated silver price from troy ounce: ₹{data.get('price')}/oz")
+
+        if price is None:
+            logger.error(f"Could not find silver price in API response. Keys available: {list(data.keys())}")
+            logger.debug(f"API response: {data}")
+            return None
+
         logger.info(f"Fetched silver price: ₹{price}/gram")
         return float(price)
     except Exception as e:
