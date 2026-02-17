@@ -87,6 +87,29 @@ def get_metafield_value(metafields: Dict, key: str, default=0):
     return float(value) if value else default
 
 
+def parse_stone_types(value: str) -> List[str]:
+    """
+    Parse stone types from either JSON array or comma-separated string.
+    Returns list of lowercase stone type names.
+    """
+    if not value:
+        return []
+
+    value = value.strip()
+
+    # Check if it's a JSON array (stone_types is stored as list.single_line_text_field)
+    if value.startswith('['):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(s).strip().lower() for s in parsed if s]
+        except json.JSONDecodeError:
+            pass
+
+    # Fall back to comma-separated parsing
+    return [s.strip().lower() for s in value.split(',') if s.strip()]
+
+
 def find_affected_products(products: List[Dict], diamond_types: Set[str]) -> List[Dict]:
     """
     Find products that have stone types matching the updated diamond types.
@@ -94,6 +117,7 @@ def find_affected_products(products: List[Dict], diamond_types: Set[str]) -> Lis
     """
     affected = []
     diamond_types_lower = {dt.lower() for dt in diamond_types}
+    products_with_stone_data = 0
 
     for product in products:
         metafields = {
@@ -104,12 +128,15 @@ def find_affected_products(products: List[Dict], diamond_types: Set[str]) -> Lis
         # Check product-level stone types
         product_stone_types = metafields.get('custom.stone_types', '')
         if product_stone_types:
-            stones = [s.strip().lower() for s in product_stone_types.split(',')]
+            products_with_stone_data += 1
+            stones = parse_stone_types(product_stone_types)
+            logger.debug(f"Product '{product['title']}' stone_types raw: {product_stone_types}, parsed: {stones}")
             if any(st in diamond_types_lower for st in stones):
                 affected.append(product)
                 continue
 
         # Check variant-level stone types
+        found_in_variant = False
         for variant_edge in product.get('variants', {}).get('edges', []):
             variant = variant_edge['node']
             variant_metafields = {
@@ -118,10 +145,27 @@ def find_affected_products(products: List[Dict], diamond_types: Set[str]) -> Lis
             }
             variant_stone_types = variant_metafields.get('custom.stone_types', '')
             if variant_stone_types:
-                stones = [s.strip().lower() for s in variant_stone_types.split(',')]
+                products_with_stone_data += 1
+                stones = parse_stone_types(variant_stone_types)
+                logger.debug(f"  Variant '{variant.get('title')}' stone_types raw: {variant_stone_types}, parsed: {stones}")
                 if any(st in diamond_types_lower for st in stones):
                     affected.append(product)
+                    found_in_variant = True
                     break
+        if found_in_variant:
+            continue
+
+    logger.info(f"Products/variants with stone_types metafield: {products_with_stone_data}")
+    if products_with_stone_data == 0:
+        logger.warning("No products have custom.stone_types metafield set. Check if metafields are being returned by API.")
+        # Log a sample product's metafields for debugging
+        if products:
+            sample = products[0]
+            sample_mf = {
+                f"{mf['node']['namespace']}.{mf['node']['key']}": mf['node']['value']
+                for mf in sample.get('metafields', {}).get('edges', [])
+            }
+            logger.info(f"Sample product '{sample['title']}' metafield keys: {list(sample_mf.keys())}")
 
     return affected
 
